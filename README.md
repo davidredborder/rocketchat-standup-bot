@@ -42,7 +42,11 @@ All of the bot's configuration is managed through a **.env** file.
    STANDUP\_TIME=0 9 \* \* 1-5
 
    \# The questions to ask the users. Separate each question with a semicolon.  
+      # The questions to ask the users. Separate each question with a semicolon.  
    QUESTIONS=What did you work on yesterday?;What are you working on today?;Do you have any blockers?
+
+   # The timeout in minutes to wait for the standup summary.
+   SUMMARY_TIMEOUT_MINUTES=30
 
 ### **Building the Docker Image**
 

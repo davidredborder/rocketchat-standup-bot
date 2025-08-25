@@ -25,6 +25,7 @@ const STANDUP_USERS = process.env.STANDUP_USERS.split(',').map(user => user.trim
 const SUMMARY_CHANNEL_NAME = process.env.SUMMARY_CHANNEL_NAME;
 const STANDUP_TIME = process.env.STANDUP_TIME || '0 9 * * 1-5'; // Default to 9:00 AM on weekdays
 const QUESTIONS_ARRAY = process.env.QUESTIONS.split(';').map(q => q.trim());
+const SUMMARY_TIMEOUT_MINUTES = parseInt(process.env.SUMMARY_TIMEOUT_MINUTES, 10) || 30;
 
 // Global variables to store the channel IDs after lookup.
 let SUMMARY_CHANNEL_ID;
@@ -256,9 +257,9 @@ const promptUsersForStandup = async () => {
     }
     
     // A final summary for non-respondents will still be published at the end.
-    const summaryScheduleTime = new Date(Date.now() + 30 * 60 * 1000);
+    const summaryScheduleTime = new Date(Date.now() + SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
     console.log(`[promptUsersForStandup] Final standup summary scheduled for: ${summaryScheduleTime.toLocaleTimeString()}`);
-    setTimeout(publishStandupSummary, 30 * 60 * 1000);
+    setTimeout(publishStandupSummary, SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
     
   } catch (error) {
     console.error('[promptUsersForStandup] Failed to prompt users:', error.message);
