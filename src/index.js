@@ -251,6 +251,9 @@ const promptUsersForStandup = async () => {
 
         // Ask the first question
         await askNextQuestion(member._id, userResponse);
+        
+        // Add a 5-second delay to avoid rate-limiting
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     } else {
       console.log('[promptUsersForStandup] No members found for the specified list.');
