@@ -115,8 +115,8 @@ const setupRealtimeApiListener = async () => {
         return;
       }
       
-      // We only care about messages in the DM stream from other users
-      if (message.u && message.u._id !== BOT_USER_ID && messageOptions.roomType === 'd') {
+      // We only care about new messages in the DM stream from other users
+      if (message.u && message.u._id !== BOT_USER_ID && messageOptions.roomType === 'd' && !message.editedAt) {
         console.log(`Received message from ${message.u.username} in DM.`);
         processStandupResponse(message);
       }
@@ -210,7 +210,9 @@ const askNextQuestion = async (userId, userResponse) => {
     let messageText;
     if (currentQuestionIndex === 0) {
       // Add the "skip" instruction to the very first question
-      messageText = `Hi ${userResponse.username}! It's time for today's standup. You can type **'skip'** at any time to skip.\n\n- ${nextQuestion}`;
+      messageText = `Hi ${userResponse.username}! It's time for today's standup. You can type **'skip'** at any time to skip. Please note that answers **cannot** be edited.
+
+- ${nextQuestion}`;
     } else {
       messageText = `- ${nextQuestion}`;
     }
