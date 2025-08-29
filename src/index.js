@@ -12,9 +12,12 @@ const { driver, api } = require('@rocket.chat/sdk');
 // Import the scheduling library
 const cron = require('node-cron');
 
-// A simple in-memory store to hold standup responses for the current day.
-// This will be reset each day. For a more robust solution, use a database.
-const standupResponses = new Map();
+// Import database setup
+const { db, initializeDatabase } = require('./database.js');
+
+// Initialize the database
+initializeDatabase();
+
 
 // --- 2. Environment Variables ---
 // Retrieve all necessary variables from the .env file.
@@ -152,12 +155,14 @@ const sendDirectMessage = async (member, text) => {
 
 /**
  * Publishes a summary for a single user to the summary channel.
- * @param {string} userId The ID of the user.
- * @param {object} userResponse The user's response object.
+ * @param {object} userResponse The user's response object from the database.
  */
-const publishIndividualSummary = async (userId, userResponse) => {
+const publishIndividualSummary = async (userResponse) => {
+  const answers = JSON.parse(userResponse.answers);
+  const questions = JSON.parse(userResponse.questions);
+
   // Use Rocket.Chat's attachments API to create a colored message block.
-  const attachments = userResponse.answers.map((ans, i) => {
+  const attachments = answers.map((ans, i) => {
     let color;
     // Assign a different color for each question
     switch(i) {
@@ -175,11 +180,11 @@ const publishIndividualSummary = async (userId, userResponse) => {
     }
 
     // Replace literal '\n' characters with escaped newlines for the API payload
-    const formattedAnswer = ans.replace(/\n/g, '\\\n');
+    const formattedAnswer = ans.replace(/\n/g, '\\n');
     
     return {
       color: color,
-      title: QUESTIONS_ARRAY[i],
+      title: questions[i],
       text: formattedAnswer
     };
   });
@@ -189,7 +194,8 @@ const publishIndividualSummary = async (userId, userResponse) => {
     // Use the api.post method with the chat.postMessage endpoint for attachments
     const result = await api.post('chat.postMessage', {
       channel: SUMMARY_CHANNEL_ID,
-      text: `--- @${userResponse.username} has completed his standup ---`,
+      text: `--- @${userResponse.username} has completed his standup ---
+`,
       attachments: attachments
     });
     console.log('[publishIndividualSummary] Individual summary published successfully!', result);
@@ -201,141 +207,219 @@ const publishIndividualSummary = async (userId, userResponse) => {
 /**
  * Asks the next question to the user.
  * @param {string} userId The user's ID.
- * @param {object} userResponse The user's response object.
  */
-const askNextQuestion = async (userId, userResponse) => {
-  const currentQuestionIndex = userResponse.answers.length;
-  if (currentQuestionIndex < QUESTIONS_ARRAY.length) {
-    const nextQuestion = QUESTIONS_ARRAY[currentQuestionIndex];
-    let messageText;
-    if (currentQuestionIndex === 0) {
-      // Add the "skip" instruction to the very first question
-      messageText = `Hi ${userResponse.username}! It's time for today's standup. You can type **'skip'** at any time to skip. Please note that answers **cannot** be edited.
+const askNextQuestion = async (userId) => {
+    db.get('SELECT * FROM responses WHERE user_id = ? AND status = "pending" ORDER BY id DESC LIMIT 1', [userId], async (err, userResponse) => {
+        if (err) {
+            console.error('Database error in askNextQuestion:', err.message);
+            return;
+        }
+
+        if (!userResponse) {
+            // This can happen if the user tries to continue an old standup.
+            console.log(`[askNextQuestion] No pending standup found for user ID: ${userId}`);
+            return;
+        }
+
+        const answers = userResponse.answers ? JSON.parse(userResponse.answers) : [];
+        const questions = JSON.parse(userResponse.questions);
+        const currentQuestionIndex = answers.length;
+
+        if (currentQuestionIndex < questions.length) {
+            const nextQuestion = questions[currentQuestionIndex];
+            let messageText;
+            if (currentQuestionIndex === 0) {
+                messageText = `Hi ${userResponse.username}! It's time for today's standup. You can type **'skip'** at any time to skip. Please note that answers **cannot** be edited.
 
 - ${nextQuestion}`;
-    } else {
-      messageText = `- ${nextQuestion}`;
-    }
-    await sendDirectMessage({ _id: userId, username: userResponse.username }, messageText);
-  } else {
-    // All questions answered, publish the summary for this user.
-    userResponse.status = 'answered';
-    await publishIndividualSummary(userId, userResponse);
-  }
+            } else {
+                messageText = `- ${nextQuestion}`;
+            }
+            await sendDirectMessage({ _id: userId, username: userResponse.username }, messageText);
+        } else {
+            // All questions answered, update status and publish the summary.
+            db.run('UPDATE responses SET status = "answered" WHERE id = ?', [userResponse.id], async (err) => {
+                if (err) {
+                    console.error('Database error updating status to answered:', err.message);
+                    return;
+                }
+                await publishIndividualSummary(userResponse);
+            });
+        }
+    });
 };
+
 
 /**
  * Prompts all users in the standup channel with the questions.
  */
 const promptUsersForStandup = async () => {
-  console.log(`\n--- Starting daily standup for specified users ---`);
-  standupResponses.clear(); // Clear previous responses
-  
-  try {
-    const validMembers = VALID_STANDUP_MEMBERS;
+    console.log(`
+--- Starting daily standup for specified users ---`);
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-    console.log(`[promptUsersForStandup] Found ${validMembers.length} valid members for standup.`);
-    console.log(`[promptUsersForStandup] Member list:`, validMembers.map(m => m.username));
+    db.run('INSERT INTO standups (standup_date) VALUES (?)', [today], function(err) {
+        if (err) {
+            // If it's a UNIQUE constraint error, a standup for today already exists.
+            if (err.message.includes('UNIQUE constraint failed')) {
+                console.log(`A standup for ${today} has already been initiated.`);
+            } else {
+                console.error('Database error creating new standup session:', err.message);
+            }
+            // We still need the ID for the existing standup
+            getStandupAndPrompt();
+        } else {
+            console.log(`Created new standup session for ${today} with ID: ${this.lastID}`);
+            // If we just created it, now we can proceed.
+            getStandupAndPrompt(this.lastID);
+        }
+    });
 
-    if (validMembers && validMembers.length > 0) {
-      for (const member of validMembers) {
-        
-        console.log(`[promptUsersForStandup] Preparing to prompt member: ${member.username} (ID: ${member._id})`);
-        
-        // Initialize the user's entry in our temporary store
-        const userResponse = {
-          username: member.username,
-          questions: QUESTIONS_ARRAY.slice(), // Store a copy of the questions
-          answers: [],
-          status: 'pending' // pending, answered, skipped
-        };
-        standupResponses.set(member._id, userResponse);
+    const getStandupAndPrompt = (standupId) => {
+        if (standupId) {
+            prompt(standupId);
+        } else {
+            db.get('SELECT id FROM standups WHERE standup_date = ?', [today], (err, row) => {
+                if (err || !row) {
+                    console.error('Could not find or create a standup session for today.');
+                    return;
+                }
+                prompt(row.id);
+            });
+        }
+    };
 
-        // Ask the first question
-        await askNextQuestion(member._id, userResponse);
+    const prompt = async (standupId) => {
+        console.log(`[promptUsersForStandup] Found ${VALID_STANDUP_MEMBERS.length} valid members for standup.`);
+        console.log(`[promptUsersForStandup] Member list:`, VALID_STANDUP_MEMBERS.map(m => m.username));
+
+        for (const member of VALID_STANDUP_MEMBERS) {
+            const responseData = {
+                standup_id: standupId,
+                user_id: member._id,
+                username: member.username,
+                questions: JSON.stringify(QUESTIONS_ARRAY),
+                answers: JSON.stringify([]),
+                status: 'pending'
+            };
+
+            db.run(
+                'INSERT INTO responses (standup_id, user_id, username, questions, answers, status) VALUES (?, ?, ?, ?, ?, ?)',
+                [responseData.standup_id, responseData.user_id, responseData.username, responseData.questions, responseData.answers, responseData.status],
+                async function(err) {
+                    if (err) {
+                        console.error(`Error creating pending response for ${member.username}:`, err.message);
+                    } else {
+                        console.log(`Created pending response for ${member.username}.`);
+                        await askNextQuestion(member._id);
+                        await new Promise(resolve => setTimeout(resolve, 5000)); // Avoid rate-limiting
+                    }
+                }
+            );
+        }
         
-        // Add a 5-second delay to avoid rate-limiting
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    } else {
-      console.log('[promptUsersForStandup] No members found for the specified list.');
-    }
-    
-    // A final summary for non-respondents will still be published at the end.
-    const summaryScheduleTime = new Date(Date.now() + SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
-    console.log(`[promptUsersForStandup] Final standup summary scheduled for: ${summaryScheduleTime.toLocaleTimeString()}`);
-    setTimeout(publishStandupSummary, SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
-    
-  } catch (error) {
-    console.error('[promptUsersForStandup] Failed to prompt users:', error.message);
-  }
+        const summaryScheduleTime = new Date(Date.now() + SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
+        console.log(`[promptUsersForStandup] Final standup summary scheduled for: ${summaryScheduleTime.toLocaleTimeString()}`);
+        setTimeout(publishStandupSummary, SUMMARY_TIMEOUT_MINUTES * 60 * 1000);
+    };
 };
+
 
 /**
  * Compiles and publishes the final standup summary for non-respondents.
  */
 const publishStandupSummary = async () => {
-  console.log(`\n--- Publishing final standup summary for channel ${SUMMARY_CHANNEL_NAME} ---`);
-  
-  let summaryText = 'Daily Standup Summary\n\n';
-  
-  if (standupResponses.size === 0) {
-    summaryText += 'No standup responses were collected today.';
-  } else {
-    standupResponses.forEach((data, userId) => {
-      if (data.status === 'skipped') {
-        summaryText += `@${data.username}: Skipped the standup.\n\n`;
-      } else if (data.status === 'pending') {
-        // Only publish for users who didn't respond at all.
-        summaryText += `@${data.username}: Did not respond.\n\n`;
-      }
-      // 'answered' status users are handled by the individual summary function
-    });
-  }
+    console.log(`
+--- Publishing final standup summary for channel ${SUMMARY_CHANNEL_NAME} ---`);
+    const today = new Date().toISOString().slice(0, 10);
 
-  // Only post if there are non-respondents or skipped users to report.
-  if (summaryText !== 'Daily Standup Summary\n\n') {
-    try {
-      console.log(`[publishIndividualSummary] Attempting to publish final summary to room ID: ${SUMMARY_CHANNEL_ID}`);
-      await driver.sendToRoomId(summaryText, SUMMARY_CHANNEL_ID);
-      console.log('[publishIndividualSummary] Final summary published successfully!');
-    } catch (error) {
-      console.error('[publishIndividualSummary] Failed to publish summary:', error.message);
-    }
-  } else {
-    console.log('[publishIndividualSummary] All users responded. No final summary needed.');
-  }
+    db.all(`
+        SELECT r.username, r.status
+        FROM responses r
+        JOIN standups s ON r.standup_id = s.id
+        WHERE s.standup_date = ? AND (r.status = 'pending' OR r.status = 'skipped')
+    `, [today], async (err, rows) => {
+        if (err) {
+            console.error('Database error fetching non-respondents:', err.message);
+            return;
+        }
+
+        if (rows.length === 0) {
+            console.log('[publishStandupSummary] All users responded or skipped individually. No final summary needed.');
+            return;
+        }
+
+        let summaryText = `Daily Standup Summary
+
+`;
+        rows.forEach(row => {
+            if (row.status === 'skipped') {
+                summaryText += `@${row.username}: Skipped the standup.
+
+`;
+            } else {
+                summaryText += `@${row.username}: Did not respond.
+
+`;
+            }
+        });
+
+        try {
+            console.log(`[publishStandupSummary] Attempting to publish final summary to room ID: ${SUMMARY_CHANNEL_ID}`);
+            await driver.sendToRoomId(summaryText, SUMMARY_CHANNEL_ID);
+            console.log('[publishStandupSummary] Final summary published successfully!');
+        } catch (error) {
+            console.error('[publishStandupSummary] Failed to publish summary:', error.message);
+        }
+    });
 };
+
 
 /**
  * Process incoming DM messages and them as standup responses.
  * @param {object} message The message object from the Realtime API.
  */
 const processStandupResponse = (message) => {
-  const userId = message.u._id;
-  const userResponse = standupResponses.get(userId);
-  
-  // Check if we are currently expecting a standup response from this user
-  if (userResponse && userResponse.status === 'pending') {
-    const text = message.msg; // No need to trim or lowercase here, as we're saving the full message
-    
-    if (text.toLowerCase().trim() === 'skip') {
-      userResponse.status = 'skipped';
-      console.log(`@${userResponse.username} skipped the standup.`);
-      // Send a confirmation and then publish the summary of the skip
-      sendDirectMessage({ _id: userId, username: userResponse.username }, 'You have skipped today\'s standup. Thank you.');
-      
-      let summaryText = `@${userResponse.username} has skipped his standup.`;
-      driver.sendToRoomId(summaryText, SUMMARY_CHANNEL_ID);
-    } else {
-      userResponse.answers.push(text); // Store the user's full answer.
-      console.log(`@${userResponse.username} answered question ${userResponse.answers.length}.`);
-      
-      // Ask the next question
-      askNextQuestion(userId, userResponse);
-    }
-  }
+    const userId = message.u._id;
+    const text = message.msg;
+
+    db.get('SELECT * FROM responses WHERE user_id = ? AND status = "pending" ORDER BY id DESC LIMIT 1', [userId], (err, userResponse) => {
+        if (err) {
+            console.error('Database error in processStandupResponse:', err.message);
+            return;
+        }
+
+        if (userResponse) {
+            if (text.toLowerCase().trim() === 'skip') {
+                db.run('UPDATE responses SET status = "skipped" WHERE id = ?', [userResponse.id], (err) => {
+                    if (err) {
+                        console.error('Database error updating status to skipped:', err.message);
+                        return;
+                    }
+                    console.log(`@${userResponse.username} skipped the standup.`);
+                    sendDirectMessage({ _id: userId, username: userResponse.username }, "You have skipped today's standup. Thank you.");
+                    
+                    let summaryText = `@${userResponse.username} has skipped his standup.`;
+                    driver.sendToRoomId(summaryText, SUMMARY_CHANNEL_ID);
+                });
+            } else {
+                const answers = JSON.parse(userResponse.answers);
+                answers.push(text);
+                const newAnswers = JSON.stringify(answers);
+
+                db.run('UPDATE responses SET answers = ? WHERE id = ?', [newAnswers, userResponse.id], (err) => {
+                    if (err) {
+                        console.error('Database error saving answer:', err.message);
+                        return;
+                    }
+                    console.log(`@${userResponse.username} answered question ${answers.length}.`);
+                    askNextQuestion(userId);
+                });
+            }
+        }
+    });
 };
+
 
 // --- 4. Main Execution ---
 // Schedule the standup to run at the configured time and days.
@@ -348,4 +432,3 @@ connect();
 
 // Keep the Node.js process running for the cron scheduler
 console.log(`Standup bot is running. It will prompt for standup at: ${STANDUP_TIME}`);
-

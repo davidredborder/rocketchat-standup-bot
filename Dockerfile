@@ -1,20 +1,18 @@
-FROM node:20-alpine AS builder
+FROM node:20
 
 WORKDIR /usr/src/app
 
 COPY package*.json ./
 
+# The official node:20 image is Debian-based and has build-essential pre-installed.
+# This is sufficient for building sqlite3.
 RUN npm install
 
 COPY . .
 
-FROM node:20-alpine
-
-WORKDIR /usr/src/app
-
-COPY --from=builder /usr/src/app/node_modules ./node_modules
-COPY --from=builder /usr/src/app/src/index.js ./
+RUN chmod +x entrypoint.sh
 
 # The .env file should be mounted as a volume at runtime.
 
-CMD [ "node", "index.js" ]
+ENTRYPOINT [ "./entrypoint.sh" ]
+CMD [ "node", "src/index.js" ]
